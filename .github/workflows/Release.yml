@@ -1,0 +1,258 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      repository-projects: write
+      id-token: write
+      attestations: write
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version_full: ${{ steps.version.outputs.full }}
+    steps:
+      - name: Check tag version
+        uses: nowsprinting/check-version-format-action@v3
+        id: version
+        with:
+          prefix: "v"
+
+      - name: Version tag only step
+        run: |
+          echo "Found valid version format in tag!"
+          echo "Full version: ${{ steps.version.outputs.full }}"
+          echo "Major version: ${{ steps.version.outputs.major }}"
+          echo "Major with pre-release: ${{ steps.version.outputs.major_prerelease }}"
+        if: steps.version.outputs.is_valid == 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Check VERSION file sameness
+        id: check_version_file
+        run: |
+          echo "Checking if VERSION file matches tag version..."
+          if [ "$(cat VERSION)" != "${{ steps.version.outputs.full }}" ]; then
+            echo "VERSION file does not match tag version!"
+            exit 1
+          fi
+          echo "VERSION file matches tag version!"
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: true
+          prerelease: ${{ steps.version.outputs.is_stable == 'false' }}
+
+  pyinstaller-build-linux:
+    runs-on: ubuntu-latest
+    needs: create-release
+    permissions:
+      contents: write
+      pull-requests: write
+      repository-projects: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Create Executable
+        id: create_executable
+        uses: skywalkerctu/pyinstaller-action@v1.3.0
+        with:
+          python_ver: "3.12.7"
+          cache: "true"
+          spec: "build.spec"
+          requirements: "requirements.txt"
+
+      - name: Compress Folder
+        run: |
+          tar -czf "${{ steps.create_executable.outputs.executable_path }}".tar.gz -C "${{ steps.create_executable.outputs.executable_path }}" .
+          ls -lh "${{ steps.create_executable.outputs.executable_path }}".tar.gz
+
+      - name: Upload Compressed Folder
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ${{ steps.create_executable.outputs.executable_path }}.tar.gz
+          asset_name: EDMT-Linux-${{ needs.create-release.outputs.version_full }}.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Compute semver (no leading v)
+        id: semver
+        run: |
+          VER='${{ needs.create-release.outputs.version_full }}'   # e.g., v1.0.0-dev2
+          echo "SEMVER_NO_V=${VER#v}" >> $GITHUB_ENV               # -> 1.0.0-dev2
+
+      - name: Build .deb (edmt)
+        run: |
+          set -euxo pipefail
+          VER_WITH_V='${{ needs.create-release.outputs.version_full }}'
+          SEMVER_NO_V="$SEMVER_NO_V"
+          PYI="${{ steps.create_executable.outputs.executable_path }}/Elite Dangerous Materials Trader"
+
+          # Stage files into a package root
+          PKGROOT=pkgroot
+          rm -rf "$PKGROOT"
+          mkdir -p "$PKGROOT/opt/edmt" "$PKGROOT/usr/bin" \
+                  "$PKGROOT/usr/share/applications" \
+                  "$PKGROOT/usr/share/icons/hicolor/256x256/apps"
+
+          # App payload
+          cp -r "$PYI/." "$PKGROOT/opt/edmt/"
+
+          # Wrapper so users can just run `edmt`
+          cat > "$PKGROOT/usr/bin/edcm" <<'EOF'
+          #!/bin/sh
+          exec /opt/edmt/Elite\ Dangerous\ Materials\ Trader "$@"
+          EOF
+          chmod +x "$PKGROOT/usr/bin/edmt"
+
+          # Desktop entry + icon
+          cat > "$PKGROOT/usr/share/applications/edmt.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Elite Dangerous Materials Trader
+          Exec=edmt
+          Categories=Game;Utility;
+          Terminal=false
+          EOF
+
+          # Install fpm and build the .deb
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+          fpm -s dir -t deb -n edcm -v "$SEMVER_NO_V" -C "$PKGROOT" \
+              --architecture amd64 \
+              --deb-compression xz \
+              --license "GPL-3.0-only" \
+              --maintainer "Yui Yukihira <197877581+skywalker-elite@users.noreply.github.com>" \
+              --description "Elite Dangerous Materials Trader" \
+              --url "https://github.com/${{ github.repository }}" \
+              -p "EDMT-${VER_WITH_V}_amd64.deb"
+
+          ls -l "EDMT-${VER_WITH_V}_amd64.deb"
+
+      - name: Generate artifact attestation
+        id: attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            EDMT-${{ needs.create-release.outputs.version_full }}_amd64.deb
+            ${{ steps.create_executable.outputs.executable_path }}.tar.gz
+
+      - name: Upload AppImage
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: EDMT-${{ needs.create-release.outputs.version_full }}_amd64.deb
+          asset_name: EDMT-${{ needs.create-release.outputs.version_full }}_amd64.deb
+          asset_content_type: application/vnd.debian.binary-package
+
+      - name: Upload Linux Attestation as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-linux
+          path: ${{ steps.attestation.outputs.bundle-path }}
+
+  pyinstaller-build:
+    runs-on: windows-latest
+    needs: create-release
+    permissions:
+      contents: write
+      pull-requests: write
+      repository-projects: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Create Executable
+        id: create_executable
+        uses: skywalkerctu/pyinstaller-action@v1.3.0
+        with:
+          python_ver: "3.12.7"
+          cache: "true"
+          spec: "build.spec"
+          requirements: "requirements.txt"
+
+      - name: Build Windows Installer (Inno Setup)
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.7
+        with:
+          path: \installer\setup.iss
+          options: /O+
+        env:
+          APP_VERSION: ${{ needs.create-release.outputs.version_full }}
+          INPUT_DIR: "${{ github.workspace }}\\dist\\Elite Dangerous Carrier Manager"
+          OUTPUT_DIR: "${{ github.workspace }}\\installer\\dist"
+
+      - name: Generate artifact attestation
+        id: attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ github.workspace }}\installer\dist\EDMT-Setup-${{ needs.create-release.outputs.version_full }}.exe
+
+      - name: Upload Windows Installer
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ${{ github.workspace }}\installer\dist\EDMT-Setup-${{ needs.create-release.outputs.version_full }}.exe
+          asset_name: EDMT-Setup-${{ needs.create-release.outputs.version_full }}.exe
+          asset_content_type: application/vnd.microsoft.portable-executable
+
+      - name: Upload Windows Attestation as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-windows
+          path: ${{ steps.attestation.outputs.bundle-path }}
+
+  combine-attestations:
+    runs-on: ubuntu-latest
+    needs: [create-release, pyinstaller-build-linux, pyinstaller-build]
+    permissions:
+      contents: write
+      pull-requests: write
+      repository-projects: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download Linux Executable Attestation
+        uses: actions/download-artifact@v4
+        with:
+          name: attestation-linux
+          path: ./attestations/linux
+
+      - name: Download Windows Executable Attestation
+        uses: actions/download-artifact@v4
+        with:
+          name: attestation-windows
+          path: ./attestations/windows
+
+      - name: Combine Attestations
+        run: |
+          jq -s '.[0] * .[1]' ./attestations/linux/attestation.json ./attestations/windows/attestation.json > combined-attestation.json
+
+      - name: Upload Combined Attestation
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./combined-attestation.json
+          asset_name: attestation.json
+          asset_content_type: application/json

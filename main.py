@@ -30,25 +30,15 @@ def _make_acquire_vars(*materials_sets):
     return acquire_vars
 
 def get_wishlist(filename):
-    df = pd.read_fwf(
+    df = pd.read_csv(
         filename,
-            colspecs=[
-            (0, 45),     # Material
-            (45, 57),    # Available S
-            (57, 75),    # Available FC
-            (75, 93),    # Available Total
-            (93, 107),   # Required min
-            (107, 121),  # Required cur
-            (121, 135),  # Required max
-            (135, 149),  # Need
-        ],
-        names=["Material", "Available S", "Available FC", "Available Total",
-            "Required min", "Required cur", "Required max", "Need"],
-        skiprows=1,  # skip the original header row
+        sep=r'\s{2,}',
+        engine='python',
+        skiprows=0,
     )
 
     required = df[["Material", "Required cur"]].dropna().set_index("Material")["Required cur"].to_dict()
-    required = {MATERIAL_NAME_TO_ID[key]: value for key, value in required.items() if key in MATERIAL_NAME_TO_ID}
+    required = {MATERIAL_NAME_TO_ID[key]: int(value) for key, value in required.items() if key in MATERIAL_NAME_TO_ID}
 
     return required
 
@@ -133,11 +123,11 @@ def solve(wishlist):
 
         # Minimum, need at least this
         problem += (
-            current + acquire_vars[material]["var"] + produced - consumed >= need, #+ surplus_vars[material],
+            current + acquire_vars[material]["var"] + produced - consumed >= need,
             f"balance_{material}"
         )
 
-        # Maximum, bins can't exceed this
+        # # Maximum, bins can't exceed this
         grade = MATERIAL_GRADES.get(material, 0)
         cap = GRADE_CAPACITIES[grade]
         problem += (
